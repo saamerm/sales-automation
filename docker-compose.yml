@@ -1,8 +1,8 @@
 services:
   linki:
-    image: moaljumaa/linki:latest
-    # To build from source instead: comment out image above and uncomment below
-    # build: .
+    # image: moaljumaa/linki:latest
+    # To use the prebuilt image instead: uncomment image above and comment out build below
+    build: .
     ports:
       - "127.0.0.1:${PORT:-3456}:3000"
     volumes:
