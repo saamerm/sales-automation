@@ -37,6 +37,7 @@ import { emitDomainEvent, processWebhookDeliveries } from "@/lib/platform/events
 import { branchLandingIndex, emailSendGapMs } from "@/lib/outreach/sequence";
 import { effectiveSchedule, localDayBoundsUtc, parseStoredTime, slotInWindow, zonedParts, zonedTimeToUtcMs } from "@/lib/outreach/schedule";
 import { guard } from "@/lib/watchdog";
+import { pruneRetiredLeases } from "@/lib/system/health";
 import { evaluateWorkflowConditions, type ConditionGroup } from "@/lib/platform/conditions";
 import { processWarmupCycle } from "@/lib/platform/deliverability";
 import { processWarmupEngagement } from "@/lib/email/warmup-engagement";
@@ -45,6 +46,7 @@ import { syncDueConnections } from "@/lib/platform/connectors";
 import { EMAIL_TAGS, renderOutreachTemplate, senderOf, type OutreachSender } from "@/lib/outreach/render";
 import { seededPick } from "@/lib/outreach/seed";
 import { aiContextOf, campaignContextText, withCampaignTone, withTriggers } from "@/lib/campaigns/context";
+import { applySpamFilter, spamLogLine, spamModeOf } from "@/lib/campaigns/spam-filter";
 import { releaseSuperseded } from "@/lib/outreach/launch";
 import { autoPromoteWhenDue } from "@/lib/campaigns/auto-promote";
 import { loadTargetCustomValues } from "@/lib/outreach/custom-values";
@@ -81,6 +83,9 @@ const INBOX_SYNC_TIMEOUT_MS = 60_000;
 const REPLY_SYNC_TIMEOUT_MS = 60_000;
 const ACCEPTED_SYNC_TIMEOUT_MS = 180_000;
 const CONNECTION_SYNC_TIMEOUT_MS = 120_000;
+// One pass over up to 20 queued addresses. Each address has its own deadline in
+// lib/email/verify.ts; this is the backstop above them, so the loop can never stop for good.
+const VERIFICATION_PASS_TIMEOUT_MS = 180_000;
 const EXECUTE_STEP_TIMEOUT_MS = 300_000;
 
 // How long a tick may keep starting new profiles. Checked BETWEEN profiles, so the tick
@@ -1320,6 +1325,15 @@ async function executeStep(
         return "done";
       }
 
+      // The campaign's spam filter: what was written is scanned, and in remove mode cleaned,
+      // before the signature is added (a signature is the sender's own) and before it is
+      // recorded as what this contact was sent, so a follow-up sees the words that went out.
+      const spam = applySpamFilter(spamModeOf(db, target.workspace_id, tr.workflow_id), { subject: emailSubject, body: emailBody });
+      const spamLine = spamLogLine(spam, name);
+      if (spamLine) log(db, runId, target.id, spam.clean && spam.clean.left.length === 0 ? "info" : "warn", spamLine);
+      emailSubject = spam.subject;
+      emailBody = spam.body;
+
       const emailAccount = db.prepare("SELECT * FROM email_accounts WHERE id = ?").get(emailAccountId) as {
         id: string; from_email: string; from_name: string | null; reply_to: string | null;
         smtp_host: string; smtp_port: number; smtp_secure: number;
@@ -1677,6 +1691,8 @@ export function ensureGlobalRunnerStarted(): void {
   }
   g.__linkiGlobalRunnerStarted = true;
   const db = getDb();
+  const retired = pruneRetiredLeases(db);
+  if (retired > 0) console.log(`[runner] Removed ${retired} lease${retired === 1 ? "" : "s"} left by loops that no longer exist`);
 
   // LinkedIn stays ONE strictly-sequential loop — every LinkedIn browser-session action
   // (tick + connection sync) runs here and nowhere else, so LinkedIn is never driven from
@@ -1701,9 +1717,13 @@ export function ensureGlobalRunnerStarted(): void {
   });
   // A day-old DNS check is looked up again, and a mailbox that could not sign in is tried again.
   startLoop("Mailbox checks", "mailbox-upkeep-runner", mailboxUpkeep);
+  // Under guard() like every loop that waits on the network: it ran bare, one address that
+  // never answered held it for hours with no log line, and 1,000+ contacts waited behind it.
   startLoop("Email verification", "verification-runner", async () => {
-    const verified = await processVerificationQueue(db);
-    if (verified > 0) console.log(`[runner] Email verification — processed ${verified}`);
+    await guard("Email verification", VERIFICATION_PASS_TIMEOUT_MS, async () => {
+      const verified = await processVerificationQueue(db);
+      if (verified > 0) console.log(`[runner] Email verification — processed ${verified}`);
+    });
   });
   startLoop("Webhook delivery", "webhook-runner", async () => { await processWebhookDeliveries(); });
   startLoop("Import scheduler", "imports-runner", async () => {

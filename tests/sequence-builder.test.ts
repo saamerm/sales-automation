@@ -41,6 +41,8 @@ import templatesHandler from "@/pages/api/templates";
 import templateHandler from "@/pages/api/templates/[id]";
 import builderHandler from "@/pages/api/workflows/[id]/builder";
 import previewHandler from "@/pages/api/workflows/[id]/preview";
+import settingsHandler from "@/pages/api/workflows/[id]/settings";
+import { setWorkspaceSpamDefault } from "@/lib/campaigns/spam-filter";
 import publishHandler from "@/pages/api/workflows/[id]/publish";
 import testSendHandler from "@/pages/api/workflows/[id]/test-send";
 import { ctxHeaders } from "./helpers/ctx";
@@ -277,6 +279,18 @@ describe("the sequence previewed for one contact", () => {
     expect(preview[4]).toMatchObject({ body: null, subject: null });
   });
 
+  it("shows the version asked for, so one email can be read in each of its versions", async () => {
+    const c = campaign(steps);
+    const lee = contact(c);
+    const email = steps.find((step) => step.key === "e1")!;
+    const read = async (pick?: number) => {
+      const res = await call(previewHandler, { method: "POST", query: { id: c.workflow }, body: { target_id: lee, steps: [email], pick }, headers: as(c, "viewer") });
+      return (res.body.steps as Array<{ subject: string; shown: { label: string } }>)[0];
+    };
+    expect(await read()).toMatchObject({ subject: "Initech + hiring", shown: { label: "Version A" } });
+    expect(await read(1)).toMatchObject({ subject: "Version B", shown: { label: "Version B" } });
+  });
+
   it("asks for a sender rather than calling the tag a mistake when none is chosen", () => {
     const c = campaign(steps);
     const lee = previewContact(db(), c.ws, contact(c))!;
@@ -352,6 +366,7 @@ describe("a test send", () => {
     const lee = contact(c);
     const post = (body: Record<string, unknown>, role: "viewer" | "member" = "member") => call(testSendHandler, { method: "POST", query: { id: c.workflow }, body, headers: as(c, role) });
     expect((await post({ step: { step_type: "message", message_body: "Hi" }, target_id: lee, email_account_id: c.mailbox })).body.error).toBe("Only an email step can be sent as a test");
+    // A step AI writes can be tested now, but only with something to write from: with no model chosen there is nothing to send.
     expect((await post({ step: { ...step, ai_enabled: 1 }, target_id: lee, email_account_id: c.mailbox })).statusCode).toBe(400);
     expect((await post({ step: { step_type: "email", email_subject: "S", email_body: "" }, target_id: lee, email_account_id: c.mailbox })).body.error).toBe("This step has nothing to send yet.");
     expect((await post({ step, target_id: lee })).body.error).toBe("Choose a mailbox to send the test from");
@@ -508,5 +523,113 @@ describe("AI rewrite", () => {
     expect(refused.statusCode).toBe(409);
     expect(refused.body).toMatchObject({ outcome: "budget_reached" });
     expect(asked).toHaveLength(4);
+  });
+});
+
+describe("the spam filter", () => {
+  const spammy: StepInput = {
+    key: "e1", step_type: "email",
+    email_subject: "Quick question!",
+    email_body: "Hi {{first_name}},\n\nAct now to see how we help. Results are guaranteed.\n\nThis is AMAZING!!!",
+  };
+  const sentLogs = (runId: string) => db().prepare("SELECT level, message FROM logs WHERE run_id = ? AND message LIKE 'Spam filter%'").all(runId) as Array<{ level: string; message: string }>;
+
+  it("flags and sends as written when a campaign has said nothing", async () => {
+    const c = campaign([spammy]);
+    contact(c);
+    const runId = await start(c);
+    await tick(db(), { pace: false });
+    expect(smtp.sent).toHaveLength(1);
+    expect(smtp.sent[0].subject).toBe("Quick question!");
+    expect(smtp.sent[0].body).toContain("Act now to see how we help.");
+    const logs = sentLogs(runId);
+    expect(logs).toHaveLength(1);
+    expect(logs[0]).toMatchObject({ level: "warn" });
+    expect(logs[0].message).toContain('"Act now"');
+  });
+
+  it("cleans the subject and body before sending, in remove mode, and leaves the signature alone", async () => {
+    const c = campaign([spammy]);
+    db().prepare("UPDATE workflows SET spam_filter = 'remove' WHERE id = ?").run(c.workflow);
+    contact(c);
+    const runId = await start(c);
+    await tick(db(), { pace: false });
+    expect(smtp.sent[0].subject).toBe("Quick question");
+    expect(smtp.sent[0].body).toContain("To see how we help.");
+    expect(smtp.sent[0].body).not.toMatch(/act now/i);
+    expect(smtp.sent[0].body).toContain("This is Amazing!");
+    // A guarantee cannot be taken out without changing what is said, so it stays, and is reported.
+    expect(smtp.sent[0].body).toContain("guaranteed");
+    expect(smtp.sent[0].body).toContain("Ada, Acme");
+    expect(sentLogs(runId)[0].message).toMatch(/cleaned the email/);
+    expect(sentLogs(runId)[0].message).toContain('"guaranteed"');
+  });
+
+  it("follows the workspace's default, which a campaign's own choice overrides", async () => {
+    const own = campaign([spammy]);
+    setWorkspaceSpamDefault(db(), own.ws, "remove");
+    contact(own);
+    await start(own);
+    await tick(db(), { pace: false });
+    expect(smtp.sent[0].subject).toBe("Quick question");
+
+    smtp.sent.length = 0;
+    const off = campaign([spammy]);
+    setWorkspaceSpamDefault(db(), off.ws, "remove");
+    db().prepare("UPDATE workflows SET spam_filter = 'off' WHERE id = ?").run(off.workflow);
+    contact(off);
+    const runId = await start(off);
+    await tick(db(), { pace: false });
+    expect(smtp.sent[0].subject).toBe("Quick question!");
+    expect(sentLogs(runId)).toEqual([]);
+  });
+
+  it("says nothing about a clean email", async () => {
+    const c = campaign([{ key: "e1", step_type: "email", email_subject: "Hiring at {{company}}", email_body: "Hi {{first_name}}, worth a quick call on Thursday?" }]);
+    contact(c);
+    const runId = await start(c);
+    await tick(db(), { pace: false });
+    expect(smtp.sent).toHaveLength(1);
+    expect(sentLogs(runId)).toEqual([]);
+  });
+
+  it("is shown in the preview as it will be sent: flagged as written, or cleaned", async () => {
+    const c = campaign([spammy]);
+    const lee = contact(c);
+    const read = async () => {
+      const res = await call(previewHandler, { method: "POST", query: { id: c.workflow }, body: { target_id: lee, steps: [spammy] }, headers: as(c, "viewer") });
+      return (res.body.steps as Array<{ subject: string; body: string; spam: { mode: string; level: string; findings: Array<{ text: string }>; removed: unknown[]; left: Array<{ text: string }> } }>)[0];
+    };
+    const flagged = await read();
+    expect(flagged.subject).toBe("Quick question!");
+    expect(flagged.spam).toMatchObject({ mode: "flag" });
+    expect(flagged.spam.findings.map((finding) => finding.text.toLowerCase())).toEqual(expect.arrayContaining(["act now", "guaranteed"]));
+
+    db().prepare("UPDATE workflows SET spam_filter = 'remove' WHERE id = ?").run(c.workflow);
+    const cleaned = await read();
+    expect(cleaned.subject).toBe("Quick question");
+    expect(cleaned.body).toContain("To see how we help.");
+    expect(cleaned.spam).toMatchObject({ mode: "remove" });
+    expect(cleaned.spam.removed.length).toBeGreaterThan(0);
+    expect(cleaned.spam.left.map((finding) => finding.text.toLowerCase())).toEqual(["guaranteed"]);
+  });
+
+  it("is a campaign setting a member may change, and a workspace default only an admin may", async () => {
+    const c = campaign([spammy]);
+    const put = (body: Record<string, unknown>, role: "member" | "manager" | "admin") => call(settingsHandler, { method: "PUT", query: { id: c.workflow }, body, headers: as(c, role) });
+
+    const own = await put({ spam_filter: "remove" }, "member");
+    expect(own.statusCode).toBe(200);
+    expect(own.body.settings).toMatchObject({ spam_filter: "remove", spam_filter_default: "flag" });
+
+    expect((await put({ spam_filter: "inherit" }, "member")).body.settings).toMatchObject({ spam_filter: "inherit" });
+    expect((await put({ spam_filter: "sometimes" }, "member")).statusCode).toBe(400);
+
+    const refused = await put({ spam_filter_default: "off" }, "manager");
+    expect(refused.statusCode).toBe(403);
+    expect(refused.body).toMatchObject({ required_role: "admin" });
+    const allowed = await put({ spam_filter_default: "off" }, "admin");
+    expect(allowed.body.settings).toMatchObject({ spam_filter: "inherit", spam_filter_default: "off" });
+    expect((await put({ spam_filter_default: "inherit" }, "admin")).statusCode).toBe(400);
   });
 });

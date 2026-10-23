@@ -1,6 +1,6 @@
 import { useState, type ReactNode } from "react";
 import Link from "next/link";
-import { CalendarClock, Check, ChevronDown, Eye, FileText, GitBranch, Mail, MessageSquare, Minus, PenLine, Plus, Send, SendHorizontal, Split, Trash2, UserPlus, X } from "lucide-react";
+import { CalendarClock, Check, ChevronDown, Eye, FileText, GitBranch, Mail, MessageSquare, Minus, PenLine, Plus, Send, SendHorizontal, Sparkles, Split, Trash2, UserPlus, X } from "lucide-react";
 import { DaysField, HoursField } from "@/components/linkedin-accounts/SettingsFields";
 import { daysSummary, hourLabel } from "@/components/linkedin-accounts/model";
 import { Button, Checkbox, Eyebrow, IconButton, Input, Popover, Select, Switch, TextAction, Textarea, type Icon } from "@/components/ui";
@@ -8,6 +8,7 @@ import { cn } from "@/lib/client/cn";
 import { formatPercent, plural } from "@/lib/client/format";
 import { recordHref } from "@/lib/client/nav";
 import { MessageEditor } from "./MessageEditor";
+import { SpamCheck } from "./SpamCheck";
 import {
   AI_LANGUAGES, CONNECT_NOTE_LIMIT, DAY, HOUR, MAX_VERSIONS, STEP_KIND_LABEL, gateOn, leader, letter, mergeTags, performance, setWaitBefore, splitLabel, stepProblems, stepTitle,
   updateRow, versionShares, versionsOf, waitBefore,
@@ -38,7 +39,7 @@ export function StepPanel({
   onDelete: () => void;
   /** Open the condition on this step, adding one if there is none. */
   onGate: () => void;
-  /** Send this email, as the version being edited, to yourself. */
+  /** Open this step for one contact: read as written, or with an AI sample, and an email can be sent to yourself. */
   onTest: (pick: number) => void;
 }) {
   const { row } = item;
@@ -125,6 +126,12 @@ export function StepPanel({
                 rewrite={{ channel: "linkedin", workflowId, ready: data.ai.has_key && Boolean(data.ai.default_model) }}
               />
             )}
+            {row.step_type === "email" && !usesAi ? (
+              <SpamCheck
+                subject={versions[shown].subject} body={versions[shown].body} mode={data.spam_filter} disabled={readOnly}
+                onClean={(text) => setVersionText(row, shown, text, set)}
+              />
+            ) : null}
             <TemplatePool row={row} channel={channel} templates={data.templates} readOnly={readOnly} set={set} />
           </>
         ) : null}
@@ -160,12 +167,16 @@ export function StepPanel({
           </>
         ) : null}
 
-        {writes && data.ai.available ? <AiSection row={row} ai={data.ai} set={set} /> : null}
+        {writes && data.ai.available ? <AiSection row={row} ai={data.ai} set={set} onTry={readOnly ? undefined : () => onTest(0)} /> : null}
 
-        {readOnly ? null : (
+        {readOnly && !writes && row.step_type !== "connect" ? null : (
           <div className="flex flex-wrap gap-2 border-t border-line pt-3">
-            <Button size="sm" icon={GitBranch} onClick={onGate}>{hasGate ? "Edit the condition" : "Add a condition"}</Button>
-            {row.step_type === "email" ? <Button size="sm" icon={SendHorizontal} disabled={usesAi} title={usesAi ? "AI writes this step when it is sent, so there is no fixed text to test" : undefined} onClick={() => onTest(shown)}>Send a test</Button> : null}
+            {readOnly ? null : <Button size="sm" icon={GitBranch} onClick={onGate}>{hasGate ? "Edit the condition" : "Add a condition"}</Button>}
+            {row.step_type === "email" ? (
+              <Button size="sm" icon={SendHorizontal} onClick={() => onTest(shown)}>{usesAi ? "Preview a sample or send a test" : readOnly ? "Preview" : "Preview or send a test"}</Button>
+            ) : writes || row.step_type === "connect" ? (
+              <Button size="sm" icon={Eye} onClick={() => onTest(0)}>{usesAi ? "Preview a sample" : row.step_type === "connect" ? "Preview the note" : "Preview"}</Button>
+            ) : null}
           </div>
         )}
       </fieldset>
@@ -400,7 +411,7 @@ function TemplatePool({ row, channel, templates, readOnly, set }: { row: Row; ch
   );
 }
 
-function AiSection({ row, ai, set }: { row: Row; ai: BuilderData["ai"]; set: (patch: Partial<StepInput>) => void }) {
+function AiSection({ row, ai, set, onTry }: { row: Row; ai: BuilderData["ai"]; set: (patch: Partial<StepInput>) => void; onTry?: () => void }) {
   const on = isOn(row.ai_enabled);
   const ready = ai.has_key && Boolean(row.ai_model || ai.default_model);
   return (
@@ -426,6 +437,12 @@ function AiSection({ row, ai, set }: { row: Row; ai: BuilderData["ai"]; set: (pa
             Language
             <Select className="w-full" value={row.ai_language ?? "English"} onChange={(value) => set({ ai_language: value })} options={AI_LANGUAGES.map((language) => ({ value: language, label: language }))} label="Language" />
           </label>
+          {onTry ? (
+            <div className="flex flex-col items-start gap-1.5">
+              <Button size="sm" icon={Sparkles} disabled={!ready || !(row.ai_prompt ?? "").trim()} onClick={onTry}>Write a sample</Button>
+              <p className="text-105 leading-[14px] text-ink-3">See what this writes for one contact, with the instruction above as it is now. It counts towards this month&apos;s AI spend.</p>
+            </div>
+          ) : null}
         </div>
       ) : null}
     </Section>
